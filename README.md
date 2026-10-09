@@ -1,891 +1,334 @@
 # Linux Miracast Receiver
 
-A Linux-based **Miracast / Wi-Fi Display (WFD) receiver** that allows an Android device to mirror its display to a Linux system over a Wi-Fi Direct P2P connection.
+A Linux-based **Miracast / Wi-Fi Display (WFD) receiver** that mirrors an Android device's screen over a Wi-Fi Direct (P2P) connection. The project implements the receiver side of the connection in C++ and uses **GStreamer directly for media playback**—there is no `ffplay` process or MPEG-TS FIFO playback path in the current implementation.
 
-The project was built from the ground up in two major stages:
+The project brings together Linux Wi-Fi networking, WFD/RTSP negotiation, RTP/RTCP reception, and an in-process GStreamer pipeline.
 
-1. **Establish the Wi-Fi Direct network**
-2. **Implement the Miracast/WFD RTSP session and receive the media stream**
+## Features
 
-The received MPEG-TS stream is played using `ffplay`, while a Python RTSP controller is used to experiment with playback control such as `PLAY`, `PAUSE`, and `RESUME`.
-
----
+- Creates a Wi-Fi Direct P2P group using `wpa_supplicant` and `wpa_cli`.
+- Configures the P2P interface and provides DHCP through `dnsmasq`.
+- Implements the Miracast/WFD RTSP sink in C++.
+- Negotiates the WFD media session with the Android source.
+- Receives RTP media over UDP and listens for RTCP on a separate UDP port.
+- Removes the RTP header and passes MPEG-TS payload data into GStreamer's `appsrc`.
+- Uses GStreamer to demultiplex MPEG-TS and decode/render H.264 video and AAC audio.
+- Provides a small Python controller to send `PAUSE`, `PLAY` (resume), and `QUIT` commands to the running C++ sink.
+- Includes a startup script that automates the network setup and launches the receiver as the desktop user.
 
 ## Architecture
 
 ```text
                          ANDROID PHONE
-                         Miracast Source
-                               │
-                               │
-                    Wi-Fi Direct / P2P
-                               │
-                               ▼
-                    ┌──────────────────┐
-                    │  wpa_supplicant  │
-                    │     wpa_cli       │
-                    └────────┬─────────┘
-                             │
-                       P2P Group
-                             │
-                             ▼
-                    ┌──────────────────┐
-                    │   p2p interface  │
-                    │  192.168.49.1    │
-                    └────────┬─────────┘
-                             │
-                           DHCP
-                         dnsmasq
-                             │
-                             ▼
-                    IP connectivity
-                             │
-                             │
-                    ┌────────▼─────────┐
-                    │   Miracast Sink  │
-                    │     startcast    │
-                    └────────┬─────────┘
-                             │
-                      RTSP / WFD
-                       negotiation
-                             │
-                             ▼
-                       RTP media
-                             │
-                             ▼
-                        MPEG-TS
-                             │
-                             ▼
-                     /tmp/miracast.ts
-                         (FIFO)
-                             │
-                             ▼
-                          ffplay
-                             │
-                             ▼
-                      Android Screen
+                          WFD Source
+                               |
+                         Wi-Fi Direct
+                               |
+                               v
+                     +-------------------+
+                     |   wpa_supplicant  |
+                     |      wpa_cli      |
+                     +---------+---------+
+                               |
+                         P2P group iface
+                               |
+                    192.168.49.0/24 network
+                               |
+                  +------------+------------+
+                  |                         |
+               dnsmasq                 C++ WFD Sink
+              DHCP server               `startcast`
+                                            |
+                                      RTSP / WFD
+                                       negotiation
+                                            |
+                                      RTP over UDP
+                                       port 19000
+                                            |
+                                   RTP header parsing
+                                            |
+                                      MPEG-TS data
+                                            |
+                                      GStreamer
+                                            |
+                                         appsrc
+                                            |
+                                         tsdemux
+                                      /           \
+                                H.264 video     AAC audio
+                                    |                |
+                              parse/decode     parse/decode
+                                    |                |
+                             autovideosink     autoaudiosink
 ```
 
----
+**Protocol layers:** Wi-Fi Direct provides connectivity; IP enables communication; RTSP/WFD negotiates the media session; RTP transports media; GStreamer handles demultiplexing, decoding, and playback.
 
-# How It Works
-
-The receiver is divided into two main stages.
+## Repository layout
 
 ```text
-        STAGE 1                         STAGE 2
-
-   Wi-Fi Direct / P2P              Miracast / WFD
-   ──────────────────              ──────────────
-
-   wpa_supplicant                  RTSP
-         │                           │
-      wpa_cli                         │
-         │                           │
-    P2P group                         │
-         │                           │
-    P2P interface                     │
-         │                           │
-       DHCP                            │
-         │                           │
-         └──────── IP connectivity ──►│
-                                     │
-                              WFD negotiation
-                                     │
-                                  RTP media
-                                     │
-                                  MPEG-TS
-                                     │
-                                  ffplay
+MiracastR/
+├── run2.sh                    # End-to-end startup and cleanup script
+├── controller.py              # Local playback-control client
+├── Makefile                   # Builds the C++ receiver
+├── conf/
+│   └── p2p_config_display     # wpa_supplicant configuration
+└── src/
+    ├── main.cpp               # RTSP/WFD session and control socket
+    ├── config.h               # IP addresses and port configuration
+    ├── rtsp_parser.cpp/.h     # RTSP message parsing
+    ├── rtsp_utils.cpp/.h      # RTSP helpers
+    ├── rtp_receiver.cpp/.h    # RTP/UDP receive and media payload handling
+    ├── rtcp_receiver.cpp/.h   # RTCP/UDP receiver
+    └── gstreamer_pipeline.cpp/.h # In-process GStreamer playback pipeline
 ```
 
-The important concept is that **Wi-Fi Direct and Miracast are separate layers**.
+## Requirements
 
-Wi-Fi Direct provides the network connection.
+The commands below target Ubuntu/Debian-based Linux. Package names can vary slightly by distribution.
 
-Miracast/WFD then uses that IP connection to establish the RTSP session and transport the media.
-
----
-
-# 1. Wi-Fi Direct Setup
-
-The Linux machine takes control of the Wi-Fi interface using `wpa_supplicant`.
-
-The startup script first stops `NetworkManager` and any existing `wpa_supplicant` instance:
+### Build tools and development headers
 
 ```bash
-systemctl stop NetworkManager
-systemctl stop wpa_supplicant
-pkill -x wpa_supplicant
+sudo apt update
+sudo apt install build-essential pkg-config python3 \
+    wpa_supplicant wireless-tools iproute2 iputils-ping \
+    dnsmasq libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 ```
 
-This avoids another network manager interfering with the P2P interface.
+### GStreamer runtime plugins
 
-`wpa_supplicant` is then started using the Linux `nl80211` driver:
+The receiver creates GStreamer elements for MPEG-TS demultiplexing, H.264/AAC parsing and decoding, and audio/video output. Install the common plugin sets:
 
 ```bash
-wpa_supplicant \
-    -i "$IFACE" \
-    -D nl80211 \
-    -c "$WPA_CONF" \
-    -B
+sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav
 ```
 
----
+Your system also needs a working desktop audio/video session for `autovideosink` and `autoaudiosink` to select suitable output sinks.
 
-# 2. Configure Wi-Fi Display
+### Wi-Fi adapter
 
-The receiver configures the WFD subelement through `wpa_cli`:
+The Wi-Fi adapter and driver must support Wi-Fi Direct/P2P through Linux `nl80211`. Availability and stability depend on the adapter, driver, and regulatory settings.
+
+## Build
+
+From the repository root:
 
 ```bash
-wpa_cli -i "$IFACE" \
-    wfd_subelem_set 0 000600111c4400c8
+make
 ```
 
-This allows the P2P/WFD negotiation to advertise the required Wi-Fi Display information.
-
----
-
-# 3. P2P Discovery
-
-The script starts P2P discovery:
+This builds the `startcast` executable. To remove generated object files and the executable:
 
 ```bash
-wpa_cli -i "$IFACE" p2p_find
+make clean
 ```
 
-After allowing discovery to run, it is stopped:
+The Makefile uses `pkg-config` to obtain compiler and linker flags for `gstreamer-1.0` and `gstreamer-app-1.0`.
+
+## Configuration
+
+The current configuration contains machine-specific values that may need to be changed before running the project.
+
+### Wi-Fi interface
+
+Edit the interface near the top of `run2.sh`:
 
 ```bash
-wpa_cli -i "$IFACE" p2p_find_stop
+IFACE="wlp0s20f3"
 ```
 
----
-
-# 4. Create the P2P Group
-
-The Linux system creates a P2P group at:
-
-```text
-Frequency: 2437 MHz
-Channel:   6
-```
-
-using:
-
-```bash
-wpa_cli -i "$IFACE" p2p_group_add freq=2437
-```
-
-The resulting P2P group interface is then detected dynamically.
-
-For example:
-
-```text
-p2p-wlp0s20f3-0
-```
-
-The exact interface name depends on the system.
-
----
-
-# 5. WPS PBC
-
-WPS Push Button Configuration is started on both interfaces:
-
-```bash
-wpa_cli -i "$IFACE" wps_pbc
-wpa_cli -i "$GROUP_IFACE" wps_pbc
-```
-
-This allows the Android device to establish the Wi-Fi Direct group connection.
-
----
-
-# 6. Configure the Linux P2P Interface
-
-The Linux side uses:
-
-```text
-192.168.49.1/24
-```
-
-The interface is configured using:
-
-```bash
-ip addr add 192.168.49.1/24 dev "$GROUP_IFACE"
-ip link set dev "$GROUP_IFACE" up
-```
-
-The resulting network is:
-
-```text
-192.168.49.0/24
-```
-
-with Linux acting as:
-
-```text
-Linux P2P interface
-        │
-        └── 192.168.49.1
-```
-
----
-
-# 7. DHCP Server
-
-`dnsmasq` is used as the DHCP server for the P2P network.
-
-The DHCP range is:
-
-```text
-192.168.49.2
-        ↓
-192.168.49.100
-```
-
-The relevant configuration is:
-
-```bash
-dnsmasq \
-    --port=0 \
-    -i "$GROUP_IFACE" \
-    --dhcp-range=192.168.49.2,192.168.49.100,24h
-```
-
-The script waits until the Android device obtains a DHCP lease.
-
-The expected Android device is:
-
-```text
-MAC: 4e:b8:8c:f8:24:35
-IP : 192.168.49.91
-```
-
-The DHCP lease is verified through the `dnsmasq` lease file and log.
-
----
-
-# Network Topology
-
-Once the connection is established:
-
-```text
-┌─────────────────────┐
-│       Android       │
-│   Miracast Source   │
-│                     │
-│  192.168.49.91      │
-└──────────┬──────────┘
-           │
-           │ Wi-Fi Direct
-           │
-           │ 192.168.49.0/24
-           │
-┌──────────▼──────────┐
-│        Linux        │
-│   Miracast Sink     │
-│                     │
-│  192.168.49.1       │
-└─────────────────────┘
-```
-
-The script also verifies connectivity using:
-
-```bash
-ping -c 1 192.168.49.91
-```
-
----
-
-# 8. Start the Miracast Sink
-
-After the P2P network is ready, the actual Miracast receiver is started:
-
-```bash
-./startcast &
-```
-
-The sink establishes the Miracast/WFD RTSP session with the Android source.
-
----
-
-# Miracast / RTSP Layer
-
-Once the network connection exists, the project moves from the networking layer into the actual Miracast protocol.
-
-The Android device acts as the:
-
-```text
-WFD Source
-```
-
-while Linux acts as the:
-
-```text
-WFD Sink
-```
-
-The RTSP session is responsible for negotiating the media session.
-
-The communication includes RTSP methods such as:
-
-```text
-OPTIONS
-GET_PARAMETER
-SET_PARAMETER
-SETUP
-PLAY
-PAUSE
-```
-
-A simplified session looks like:
-
-```text
-Android                         Linux
- Source                          Sink
-   │                               │
-   │────── RTSP connection ───────►│
-   │                               │
-   │◄──────── OPTIONS ─────────────│
-   │                               │
-   │──── WFD negotiation ─────────►│
-   │                               │
-   │◄──── GET_PARAMETER ───────────│
-   │                               │
-   │──── SET_PARAMETER ───────────►│
-   │                               │
-   │◄──────── SETUP ───────────────│
-   │                               │
-   │─────── PLAY ─────────────────►│
-   │                               │
-   │══════ RTP media packets ═════►│
-   │                               │
-```
-
-Correct RTSP session handling is required before the Android source will begin sending the media stream.
-
----
-
-# Media Pipeline
-
-After successful negotiation, the Android device sends the media stream to the Linux sink.
-
-The pipeline is:
-
-```text
-Android Display
-      │
-      ▼
-   H.264
-      │
-      ▼
-     RTP
-      │
-      ▼
-Miracast Sink
-      │
-      ▼
-  MPEG-TS
-      │
-      ▼
-/tmp/miracast.ts
-      │
-      ▼
-    ffplay
-      │
-      ▼
-Linux Display
-```
-
-The project uses a named pipe:
-
-```text
-/tmp/miracast.ts
-```
-
-created with:
-
-```bash
-mkfifo /tmp/miracast.ts
-```
-
-The Miracast sink writes the MPEG-TS stream into the FIFO while `ffplay` consumes it.
-
-This provides a simple producer/consumer media pipeline:
-
-```text
-        Producer                    Consumer
-
-     Miracast Sink                 ffplay
-          │                           ▲
-          │                           │
-          └──── /tmp/miracast.ts ─────┘
-                 named FIFO
-```
-
----
-
-# Low-Latency Playback
-
-`ffplay` is started with low-latency options:
-
-```bash
-ffplay \
-    -fflags nobuffer \
-    -flags low_delay \
-    -framedrop \
-    -sync ext \
-    -f mpegts \
-    /tmp/miracast.ts
-```
-
-These options are intended to reduce buffering and keep playback close to real time.
-
-Because the main startup script runs with root privileges, `ffplay` is explicitly launched as the normal desktop user:
-
-```bash
-sudo -u "$USER_NAME" ...
-```
-
-with the required desktop environment variables:
-
-```text
-HOME
-USER
-LOGNAME
-XDG_RUNTIME_DIR
-DISPLAY
-XAUTHORITY
-```
-
-This allows `ffplay` to access the graphical desktop correctly.
-
----
-
-# RTSP Control
-
-A separate Python script is used to interact with the RTSP session.
-
-The controller can send commands such as:
-
-```text
-[p] Pause
-[r] Resume
-[q] Quit
-```
-
-Conceptually:
-
-```text
-             Python Controller
-                     │
-                     │ RTSP
-                     ▼
-             Miracast RTSP Session
-                     │
-          ┌──────────┼──────────┐
-          │          │          │
-         PLAY       PAUSE      RESUME
-          │          │          │
-          └──────────┼──────────┘
-                     │
-                     ▼
-              Media Session
-```
-
-This was also used to inspect and test how the Android Miracast source responds to RTSP control messages.
-
----
-
-# Complete End-to-End Flow
-
-The entire project can be summarized as:
-
-```text
-┌──────────────────────────────────────────────────────────┐
-│                      ANDROID PHONE                       │
-│                   Miracast / WFD Source                  │
-└───────────────────────────┬──────────────────────────────┘
-                            │
-                            │ Wi-Fi Direct
-                            ▼
-┌──────────────────────────────────────────────────────────┐
-│                    wpa_supplicant                        │
-│                       wpa_cli                             │
-│                                                          │
-│   P2P discovery → group formation → WPS → P2P interface │
-└───────────────────────────┬──────────────────────────────┘
-                            │
-                            ▼
-                    192.168.49.0/24
-                            │
-                     ┌──────┴──────┐
-                     │             │
-                     ▼             ▼
-              Linux .1       Android .91
-                     │
-                     │ DHCP
-                     │
-                     ▼
-                  dnsmasq
-                     │
-                     ▼
-┌──────────────────────────────────────────────────────────┐
-│                     Miracast Sink                        │
-│                        startcast                         │
-│                                                          │
-│                RTSP / WFD negotiation                    │
-└───────────────────────────┬──────────────────────────────┘
-                            │
-                            │ RTP
-                            ▼
-                       MPEG-TS
-                            │
-                            ▼
-                   /tmp/miracast.ts
-                            │
-                            ▼
-                         ffplay
-                            │
-                            ▼
-                     Linux Display
-```
-
----
-
-# Startup Script
-
-The complete startup sequence is automated by the main shell script.
-
-The script performs:
-
-```text
-1.  Check root privileges
-2.  Determine desktop user
-3.  Stop NetworkManager
-4.  Stop existing wpa_supplicant
-5.  Start wpa_supplicant
-6.  Configure WFD
-7.  Start P2P discovery
-8.  Create P2P group
-9.  Detect P2P interface
-10. Start WPS PBC
-11. Configure Linux P2P IP
-12. Start dnsmasq
-13. Wait for Android DHCP lease
-14. Verify phone connectivity
-15. Create MPEG-TS FIFO
-16. Start Miracast sink
-17. Start ffplay
-18. Wait for sink
-19. Stop ffplay when sink exits
-20. Stop DHCP server
-21. Restore NetworkManager
-22. Restart system wpa_supplicant
-```
-
-This makes the entire receiver startup process reproducible with a single command.
-
----
-
-# Requirements
-
-## Hardware
-
-* Linux PC/laptop
-* Wi-Fi adapter supporting Wi-Fi Direct/P2P
-* Android device supporting Miracast / Wi-Fi Display
-
-## Software
-
-* Linux
-* `wpa_supplicant`
-* `wpa_cli`
-* `dnsmasq`
-* Python 3
-* FFmpeg / `ffplay`
-* `iproute2`
-* `ping`
-
-Check the required tools:
-
-```bash
-wpa_supplicant -v
-wpa_cli -v
-dnsmasq --version
-python3 --version
-ffplay -version
-ip -V
-```
-
----
-
-# Running
-
-The startup script must be executed with root privileges:
-
-```bash
-sudo ./<startup-script>.sh
-```
-
-The script will then:
-
-```text
-Wi-Fi Direct setup
-       ↓
-P2P group creation
-       ↓
-DHCP
-       ↓
-Android connection
-       ↓
-Miracast sink
-       ↓
-RTSP negotiation
-       ↓
-RTP media
-       ↓
-MPEG-TS
-       ↓
-ffplay
-```
-
-Once the sink is running, the Android device can initiate a Miracast connection.
-
----
-
-# Debugging
-
-Useful commands while developing/testing the receiver:
-
-### Inspect interfaces
+Find your wireless interface with:
 
 ```bash
 ip link
-ip addr
-iw dev
 ```
 
-### Check wpa_supplicant
+### Network addresses and ports
+
+The current implementation expects the following values:
+
+| Setting | Current value | Purpose |
+|---|---:|---|
+| Linux P2P address | `192.168.49.1` | Address assigned to the Linux P2P group interface |
+| Android source address | `192.168.49.91` | Address used by the C++ sink to connect to the source's RTSP server |
+| RTSP port | `7236` | RTSP/WFD session |
+| RTP UDP port | `19000` | Incoming media packets |
+| RTCP UDP port | `19001` | RTCP reception |
+| Local controller | `127.0.0.1:9999` | Python-to-C++ control connection |
+| P2P group frequency | `2437 MHz` | 2.4 GHz channel 6 |
+
+The Android IP is currently hard-coded in `src/config.h`; the Linux IP and interface are also configured in the source/startup script. If your phone receives a different address, update the configuration consistently.
+
+## Run
+
+Build the project first, then start the full setup script from a terminal in the repository directory:
 
 ```bash
-wpa_cli -i wlp0s20f3 status
+make
+sudo ./run2.sh
 ```
 
-### Monitor P2P state
+The script automates the Wi-Fi Direct setup, starts the DHCP server, waits for the phone to connect, and launches `startcast` as the desktop user so GStreamer can access the graphical and audio sessions. The script may temporarily stop `NetworkManager` and the system `wpa_supplicant` while it configures the adapter. Avoid running it on a Wi-Fi interface you need for another active connection.
+
+When the phone is connected and the sink is running, open the Android device's screen-casting / wireless-display UI and connect to the Linux receiver if it is not already connected.
+
+Press **Ctrl+C** in the startup terminal to stop the session and run the script's cleanup routine.
+
+> The startup script is tailored to the configuration of the machine on which it was developed. Review `run2.sh` before running it on another system, especially the interface name, IP settings, and service-management commands.
+
+## Playback controls
+
+`controller.py` connects to the C++ sink over loopback TCP at `127.0.0.1:9999`. It does not play media itself; it asks the sink to send RTSP control requests over the existing WFD session.
+
+Run it in another terminal while `startcast` is running:
 
 ```bash
-wpa_cli -i wlp0s20f3
+python3 controller.py
 ```
 
-### Check DHCP leases
+Commands:
+
+- `p` — send RTSP `PAUSE`.
+- `r` — send RTSP `PLAY` to resume.
+- `q` — send `QUIT` to the C++ controller endpoint and exit the Python controller.
+
+The phone may also send RTSP playback requests as part of its own screen-casting session.
+
+## Media pipeline
+
+The C++ RTP receiver listens for UDP media on port `19000`. It parses RTP packet headers and forwards the MPEG-TS payload to the GStreamer pipeline. The pipeline is created inside the receiver process; media does not pass through an external player or a named FIFO.
+
+Conceptually, the pipeline is:
+
+```text
+RTP/UDP
+   |
+C++ RTP receiver
+   |  strips RTP header
+   v
+MPEG-TS payload
+   |
+GStreamer appsrc
+   |
+ tsdemux
+   +--------------------------+
+   |                          |
+ H.264 video                 AAC audio
+   |                          |
+ h264parse                   aacparse
+   |                          |
+ video decoder               AAC decoder
+   |                          |
+ autovideosink               audio conversion/resampling
+                              |
+                         autoaudiosink
+```
+
+GStreamer starts when valid media data arrives. The exact output device and sink selected by `autovideosink` / `autoaudiosink` depend on the Linux desktop environment and installed plugins.
+
+## RTSP / WFD session
+
+The C++ receiver handles the RTSP control channel and negotiates the WFD session. The exchange can include methods such as:
+
+- `OPTIONS`
+- `GET_PARAMETER`
+- `SET_PARAMETER`
+- `SETUP`
+- `PLAY`
+- `PAUSE`
+- `TEARDOWN`
+
+A simplified flow is:
+
+```text
+Android WFD Source                     Linux WFD Sink
+       |                                      |
+       |----------- RTSP session ------------>|
+       |<---------- WFD negotiation ----------|
+       |<------------- SETUP -----------------|
+       |<-------------- PLAY -----------------|
+       |                                      |
+       |========== RTP media over UDP =======>|
+       |                                      |----> GStreamer
+       |<------------- RTCP ----------------->|      playback
+```
+
+The precise message order and which side initiates particular requests depend on the source implementation and session state.
+
+## Troubleshooting
+
+### Check the wireless interface
+
+```bash
+ip link
+```
+
+Make sure the interface configured in `run2.sh` exists and supports P2P operations.
+
+### Check the DHCP lease and logs
 
 ```bash
 cat /tmp/miracast-dnsmasq.leases
-```
-
-### Check dnsmasq logs
-
-```bash
 cat /tmp/miracast-dnsmasq.log
 ```
 
-### Test Android connectivity
+Confirm that the phone received the address expected by `src/config.h` (`192.168.49.91` by default).
+
+### Check connectivity
 
 ```bash
-ping 192.168.49.91
+ping -c 3 192.168.49.91
 ```
 
-### Inspect RTSP traffic
+A failed ping is not conclusive by itself, since a device or firewall may not respond to ICMP. Check the DHCP lease and RTSP connection logs as well.
+
+### Check GStreamer plugins
+
+Inspect the installed GStreamer environment:
 
 ```bash
-tcpdump -i <p2p-interface> port 7236
+gst-inspect-1.0 tsdemux
+gst-inspect-1.0 h264parse
+gst-inspect-1.0 avdec_h264
+gst-inspect-1.0 aacparse
+gst-inspect-1.0 avdec_aac
 ```
 
-### Inspect UDP traffic
+If the receiver reports that an element cannot be created, install the GStreamer plugin package that provides that element. Video/audio output issues can also be caused by the desktop session or output device.
+
+### Port already in use
+
+Check whether another process is listening on the configured ports:
 
 ```bash
-tcpdump -i <p2p-interface> udp
+sudo ss -lntup | grep -E ':(7236|19000|19001|9999)\b'
 ```
 
----
+Stop any stale receiver process before starting another instance.
 
-# RTSP Testing
+## Project learnings
 
-The RTSP server can be tested independently.
+This project explores the interaction of several system layers:
 
-For example:
+- **Linux networking:** interfaces, Wi-Fi Direct, P2P groups, IP addressing, DHCP, and UDP/TCP sockets.
+- **Miracast / Wi-Fi Display:** source/sink roles and WFD capability negotiation.
+- **RTSP:** request/response handling, session state, sequence numbers, and playback control.
+- **RTP/RTCP:** UDP media reception, RTP header parsing, payload handling, and a separate RTCP socket.
+- **Multimedia:** MPEG-TS demultiplexing, H.264/AAC decoding, timestamps, and audio/video output through GStreamer.
+- **Linux integration:** shell automation, process cleanup, desktop-session environment, and debugging with network tools.
 
-```bash
-printf 'OPTIONS * RTSP/1.0\r\nCSeq: 2\r\n\r\n' | \
-nc -v 192.168.49.91 7236
-```
+## Possible future improvements
 
-A successful response contains an RTSP status such as:
-
-```text
-RTSP/1.0 200 OK
-```
-
-This is useful for debugging the RTSP layer without relying entirely on the Android Miracast UI.
-
----
-
-# Project Components
-
-```text
-miracast-receiver/
-│
-├── startup.sh
-│
-├── startcast
-│
-├── controller.py
-│
-├── <RTSP / receiver source>
-│
-├── <wpa_supplicant configuration>
-│
-└── README.md
-```
-
-The main components are:
-
-| Component           | Purpose                                 |
-| ------------------- | --------------------------------------- |
-| `startup.sh`        | Automates the complete receiver startup |
-| `wpa_supplicant`    | Provides Wi-Fi Direct/P2P functionality |
-| `wpa_cli`           | Controls P2P and WFD configuration      |
-| `dnsmasq`           | Provides DHCP for the P2P network       |
-| `startcast`         | Miracast/WFD sink                       |
-| RTSP implementation | Handles WFD session negotiation         |
-| `controller.py`     | Sends RTSP playback/control commands    |
-| `/tmp/miracast.ts`  | MPEG-TS named pipe                      |
-| `ffplay`            | Displays the received video             |
-
----
-
-# What I Learned
-
-This project involved working across several layers of a real multimedia networking stack:
-
-### Linux networking
-
-* Network interfaces
-* Wi-Fi Direct
-* P2P groups
-* `wpa_supplicant`
-* `wpa_cli`
-* DHCP
-* `dnsmasq`
-* TCP/UDP
-
-### Miracast / WFD
-
-* Wi-Fi Display architecture
-* WFD negotiation
-* RTSP session management
-* RTSP control methods
-* Source/Sink roles
-
-### Multimedia
-
-* RTP
-* H.264 streaming
-* MPEG-TS
-* Named FIFOs
-* FFmpeg / FFplay
-* Low-latency playback
-
-### Debugging
-
-* Network traffic inspection
-* RTSP packet analysis
-* DHCP lease debugging
-* Linux process management
-* Interface and connectivity debugging
-
----
-
-# Lessons From the Architecture
-
-One of the main takeaways from this project is that a Miracast connection is not a single protocol.
-
-It is a stack:
-
-```text
-Miracast
-   │
-   ├── Wi-Fi Direct
-   │
-   ├── IP networking
-   │
-   ├── RTSP / WFD
-   │
-   ├── RTP
-   │
-   ├── H.264
-   │
-   └── Media playback
-```
-
-Each layer has a different responsibility.
-
-```text
-Wi-Fi Direct
-    ↓
-Creates the network
-
-DHCP / IP
-    ↓
-Provides connectivity
-
-RTSP / WFD
-    ↓
-Negotiates the Miracast session
-
-RTP
-    ↓
-Transports media
-
-MPEG-TS / FFplay
-    ↓
-Processes and displays the stream
-```
-
-Understanding and debugging the project therefore required following the data from the **wireless P2P layer all the way up to the video display**.
-
----
-
-# Future Improvements
-
-Possible extensions include:
-
-* Automatic discovery of Android Miracast sources
-* Removing hard-coded MAC/IP configuration
-* Automatic IP detection
-* More robust RTSP state management
-* Automatic reconnect
-* Audio support
-* Hardware-accelerated H.264 decoding
-* Native FFmpeg/GStreamer integration
-* Better RTSP error handling
-* Graceful shutdown using shell traps
-* Support for multiple Miracast sources
-
----
+- Discover the source IP dynamically instead of hard-coding it.
+- Make interface and port settings configurable through command-line options or a config file.
+- Improve RTSP error handling and reconnect behavior.
+- Harden shutdown and resource cleanup paths.
+- Improve media timing, buffering, and audio/video synchronization.
+- Add clearer runtime diagnostics for missing GStreamer elements and output-device failures.
 
 ## License
 
-```text
-MIT License
-```
-
----
-
-## Author
-
-Built as a hands-on Linux multimedia and networking project exploring **Wi-Fi Direct, Miracast/WFD, RTSP, RTP, MPEG-TS and real-time video streaming**.
-
+See [`LICENSE`](LICENSE).
